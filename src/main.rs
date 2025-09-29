@@ -78,9 +78,9 @@ fn main() -> Result<()> {
         fs::create_dir_all(&opt.output_dir)?;
     }
     
-    // 收集所有源文件
-    let java_files = collect_java_files(&opt.source_dir)?;
-    info!("找到 {} 个Java源文件", java_files.len());
+    // 收集所有源文件（包括Java和非Java文件）
+    let (java_files, non_java_files) = collect_source_files(&opt.source_dir)?;
+    info!("找到 {} 个Java源文件，{} 个非Java文件", java_files.len(), non_java_files.len());
     
     // 为每个源文件找到对应的class文件
     let mut failed = false;
@@ -111,8 +111,40 @@ fn main() -> Result<()> {
     // 用于记录所有class文件的JDK版本
     let mut jdk_versions: HashMap<String, Vec<PathBuf>> = HashMap::new();
     
+    // 首先复制非Java文件
+    println!("开始复制非Java文件...");
+    let mut copied_non_java_files = 0;
+    
+    for non_java_file in &non_java_files {
+        let rel_path = non_java_file.strip_prefix(&opt.source_dir)
+            .with_context(|| format!("无法获取相对路径: {:?}", non_java_file))?;
+        
+        let target_path = opt.output_dir.join(rel_path);
+        
+        // 确保目标目录存在
+        if let Some(parent) = target_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        
+        // 获取文件大小
+        let file_size = non_java_file.metadata()
+            .with_context(|| format!("无法获取文件元数据: {:?}", non_java_file))?.len();
+        
+        println!("非Java文件：{}，大小：{} 字节", rel_path.to_string_lossy(), file_size);
+        
+        // 复制文件
+        fs::copy(non_java_file, &target_path)
+            .with_context(|| format!("复制文件失败: {:?} -> {:?}", non_java_file, target_path))?;
+        
+        copied_non_java_files += 1;
+    }
+    
+    if copied_non_java_files > 0 {
+        println!("----------------------------------------");
+    }
+    
     // 复制所有class文件到输出目录并检查版本
-    println!("开始复制文件并检查JDK版本...");
+    println!("开始复制Java文件对应的class文件并检查JDK版本...");
     
     let mut copied_files = 0;
     
@@ -174,6 +206,8 @@ fn main() -> Result<()> {
     println!("\n--- 汇总信息 ---");
     println!("源文件总数: {}", source_to_classes.len());
     println!("class文件总数: {}", copied_files);
+    println!("非Java文件总数: {}", copied_non_java_files);
+    println!("复制文件总计: {}", copied_files + copied_non_java_files);
     
     // 检查是否有不同的JDK版本
     if jdk_versions.len() > 1 {
@@ -188,24 +222,29 @@ fn main() -> Result<()> {
         println!("所有文件JDK版本: {}", version);
     }
     
-    info!("成功复制 {} 个class文件到 {:?}", copied_files, opt.output_dir);
+    info!("成功复制 {} 个class文件和 {} 个非Java文件到 {:?}", copied_files, copied_non_java_files, opt.output_dir);
     Ok(())
 }
 
-/// 收集指定目录下的所有Java源文件
-fn collect_java_files(source_dir: &Path) -> Result<Vec<PathBuf>> {
+/// 收集指定目录下的所有源文件，返回Java文件和非Java文件的列表
+fn collect_source_files(source_dir: &Path) -> Result<(Vec<PathBuf>, Vec<PathBuf>)> {
     let mut java_files = Vec::new();
+    let mut non_java_files = Vec::new();
     
     for entry in WalkDir::new(source_dir) {
         let entry = entry?;
         let path = entry.path();
         
-        if path.is_file() && path.extension().map_or(false, |ext| ext == "java") {
-            java_files.push(path.to_path_buf());
+        if path.is_file() {
+            if path.extension().map_or(false, |ext| ext == "java") {
+                java_files.push(path.to_path_buf());
+            } else {
+                non_java_files.push(path.to_path_buf());
+            }
         }
     }
     
-    Ok(java_files)
+    Ok((java_files, non_java_files))
 }
 
 /// 查找Java文件对应的所有class文件
