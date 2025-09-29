@@ -1,0 +1,133 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# 统一用 bash，跨平台脚本更一致
+defaults:
+  run:
+    shell: bash
+
+permissions: { contents: read }
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          # Linux: 静态/更通用的 musl 版本
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            ext: ""
+          # Windows: MSVC
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            ext: ".exe"
+          # macOS: 仅 Apple 芯片 (arm64)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            ext: ""
+
+    env:
+      # 二进制文件名：与你项目里的 CLI 名一致
+      BIN_NAME: src_to_class
+      # 发布产物前缀：用仓库名
+      PROJECT_NAME: copy_src_to_class
+      # 版本（标签名，如 v1.2.3）
+      VERSION: ${{ github.ref_name }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # 安装 stable 工具链 + 目标
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # 缓存构建
+      - uses: Swatinem/rust-cache@v2
+
+      # Linux musl 需要工具链
+      - name: Install musl tools (Linux musl only)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build (release)
+        run: cargo build --release --target ${{ matrix.target }}
+
+      # 可选 strip（Windows 跳过）
+      - name: Strip binary (non-Windows)
+        if: matrix.os != 'windows-latest'
+        run: |
+          BIN="target/${{ matrix.target }}/release/${{ env.BIN_NAME }}${{ matrix.ext }}"
+          if command -v strip >/dev/null; then strip "$BIN" || true; fi
+
+      # 产出二进制 + 生成校验和
+      - name: Prepare binary & checksum
+        id: out
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+
+          SRC="target/${{ matrix.target }}/release/${{ env.BIN_NAME }}${{ matrix.ext }}"
+          OUT="${{ env.PROJECT_NAME }}-${{ env.VERSION }}-${{ matrix.target }}${{ matrix.ext }}"
+          DEST="dist/${OUT}"
+
+          cp "$SRC" "$DEST"
+          if [ "${{ matrix.os }}" != "windows-latest" ]; then
+            chmod +x "$DEST" || true
+          fi
+
+          # 生成 SHA256 校验和
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "$DEST" > "${DEST}.sha256"
+          elif command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$DEST" > "${DEST}.sha256"
+          elif command -v certutil >/dev/null 2>&1; then
+            certutil -hashfile "$DEST" SHA256 | sed -n '2p' | tr -d '\r' | awk -v f="$DEST" '{print $1 "  " f}' > "${DEST}.sha256"
+          else
+            powershell -Command "(Get-FileHash \"$DEST\" -Algorithm SHA256).Hash + '  ' + '$DEST'" > "${DEST}.sha256"
+          fi
+
+          echo "file=$DEST" >> "$GITHUB_OUTPUT"
+          echo "checksum=${DEST}.sha256" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.PROJECT_NAME }}-${{ env.VERSION }}-${{ matrix.target }}
+          path: |
+            ${{ steps.out.outputs.file }}
+            ${{ steps.out.outputs.checksum }}
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+        # 将多个矩阵产物合并到同一目录
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
